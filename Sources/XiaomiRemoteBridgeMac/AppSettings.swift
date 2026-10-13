@@ -36,6 +36,10 @@ enum XiaomiRemoteVariant: String, CaseIterable, Identifiable {
             .uppercased()
         {
         case "RC003": return .rc003Pro
+        // Local experiment only: this unit reports RC001 over the same Bluetooth
+        // name and VID/PID as the RC003, so the model gate is bypassed to test
+        // protocol compatibility. Not verified support.
+        case "RC001": return .rc003Pro
         case "ARN9": return .arn9
         default: return nil
         }
