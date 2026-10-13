@@ -42,6 +42,20 @@ private final class XiaomiRemoteBridgeAppDelegate: NSObject, NSApplicationDelega
         model.startIfNeeded()
         updateController.start()
         refreshMenuStatus()
+        startDiagnosticLoopToneIfRequested()
+    }
+
+    /// Diagnostic only. With `OVB_LOOP_TONE=1` in the environment the app repeats its
+    /// 1-second test tone every 2 seconds, so an external level meter can verify whether
+    /// the selected output device actually receives audio. The virtual loopback device is
+    /// silent by design, so delivery cannot be observed from outside the app otherwise.
+    /// The variable is absent in normal use, so this never runs for users.
+    private func startDiagnosticLoopToneIfRequested() {
+        guard ProcessInfo.processInfo.environment["OVB_LOOP_TONE"] == "1" else { return }
+        AppLogger.shared.write("DIAG LOOP_TONE enabled")
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.model.sendTestTone()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

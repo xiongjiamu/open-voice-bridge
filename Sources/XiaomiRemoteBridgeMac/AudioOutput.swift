@@ -162,45 +162,100 @@ final class VirtualAudioOutput {
         }
 
         let engine = AVAudioEngine()
-        let player = AVAudioPlayerNode()
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: sourceFormat)
-
+        // The HAL output unit must exist — and already point at the selected device —
+        // *before* the graph is connected. Two AVAudioEngine behaviours make the naive
+        // order (connect, set device, start) silently play to the system default output
+        // instead: touching `mainMixerNode` instantiates the output chain around the
+        // current default device, and `prepare()`/`start()` re-bind the unit to the
+        // default again. Both calls still return success, so the misroute is invisible.
+        // Order here: select device → build graph → start → verify by read-back.
         guard let outputUnit = engine.outputNode.audioUnit else {
             status = "无法打开 CoreAudio 输出单元"
             return false
         }
-        var deviceID = device.id
-        let result = AudioUnitSetProperty(
-            outputUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard result == noErr else {
-            status = "无法选择音频设备（错误 \(result)）"
+
+        func applyDevice() -> OSStatus {
+            var deviceID = device.id
+            return AudioUnitSetProperty(
+                outputUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &deviceID,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
+            )
+        }
+
+        func boundDeviceID() -> AudioDeviceID? {
+            var deviceID = AudioDeviceID(0)
+            var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+            guard AudioUnitGetProperty(
+                outputUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &deviceID,
+                &size
+            ) == noErr else { return nil }
+            return deviceID
+        }
+
+        guard applyDevice() == noErr else {
+            status = "无法选择音频设备"
+            AppLogger.shared.write("AUDIO ERROR device_select_failed want=\(device.id)")
             return false
         }
+
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: sourceFormat)
 
         do {
             engine.prepare()
             try engine.start()
-            player.play()
-            self.engine = engine
-            self.player = player
-            selectedDevice = device
-            status = "语音输出：\(device.name)"
-            // Log de-identified: the device name/UID is shown in the UI status
-            // above but must never be written to the on-disk log.
-            AppLogger.shared.write("AUDIO READY")
-            return true
         } catch {
             status = "启动音频输出失败：\(error.localizedDescription)"
             AppLogger.shared.write("AUDIO ERROR start_failed=\(error.localizedDescription)")
             return false
         }
+
+        // AVAudioEngine re-binds its output unit to the *system default* while the graph is
+        // started, so applying the device before `start()` can read back as the requested
+        // device while the IO still runs on the default one. Field-verified on macOS 27:
+        // audio of a running bridge was audible on the system default output (speakers, then
+        // headphones) although the property reported the selected virtual device. So
+        // re-apply the device on the just-started unit, verify, and retry once with the unit
+        // stopped; then refuse to pretend. Never fall through to the system default output.
+        var applied = (applyDevice() == noErr) && (boundDeviceID() == device.id)
+        if !applied {
+            engine.stop()
+            _ = applyDevice()
+            do {
+                try engine.start()
+            } catch {
+                status = "启动音频输出失败：\(error.localizedDescription)"
+                AppLogger.shared.write("AUDIO ERROR start_failed=\(error.localizedDescription)")
+                return false
+            }
+            applied = (applyDevice() == noErr) && (boundDeviceID() == device.id)
+        }
+        guard applied else {
+            let actual = boundDeviceID().map(String.init) ?? "unknown"
+            engine.stop()
+            status = "输出设备未生效（当前绑定 \(actual)，期望 \(device.id)）"
+            AppLogger.shared.write("AUDIO ERROR device_not_applied want=\(device.id) actual=\(actual)")
+            return false
+        }
+
+        player.play()
+        self.engine = engine
+        self.player = player
+        selectedDevice = device
+        status = "语音输出：\(device.name)"
+        // Log de-identified: the device name/UID is shown in the UI status
+        // above but must never be written to the on-disk log.
+        AppLogger.shared.write("AUDIO READY")
+        return true
     }
 
     var isReadyForTestTone: Bool {
